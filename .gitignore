@@ -1,0 +1,11 @@
+*.rar
+*.zip
+*.mp4
+*.exe
+*.pyc
+*.png
+*.pdf
+*.pt
+*.gz
+data/
+__pycache__/
