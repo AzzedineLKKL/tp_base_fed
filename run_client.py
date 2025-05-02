@@ -66,6 +66,7 @@ def main():
         model=model,
         train_loader=train_loader,
         test_loader=val_loader,
+        client_id=args.cid,
         device=device
     )
     
