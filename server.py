@@ -201,18 +201,28 @@ class FedAvgStrategy(Strategy):
         model = CustomFashionModel()
         ndarrays = model.get_model_parameters()
         return ndarrays_to_parameters(ndarrays)
+    
     def evaluate(
         self, server_round: int, parameters: Parameters
     ) -> Optional[Tuple[float, Dict[str, Scalar]]]:
-    
+        """Evaluate the model centrally (if evaluate_fn is provided).
+        
+        Args:
+            server_round: Current round in the federated learning process
+            parameters: Model parameters to evaluate
+            
+        Returns:
+            Optional tuple containing (loss, metrics) or None
+        """
         if self.evaluate_fn is None:
-        # No central evaluation function provided
+            # No central evaluation function provided
             return None
-    
-    # If an evaluation function was provided, use it
+        
+        # If an evaluation function was provided, use it
         ndarrays = parameters_to_ndarrays(parameters)
         loss, metrics = self.evaluate_fn(server_round, ndarrays, {})
         return loss, metrics
+    
     def configure_fit(
         self, server_round: int, parameters: Parameters, client_manager: ClientManager
     ) -> List[Tuple[ClientProxy, FitIns]]:
@@ -265,7 +275,24 @@ class FedAvgStrategy(Strategy):
         if not results:
             return None, {}
         
-        # Convert results to (weights, num_examples) tuples
+        # Separate results by attack type to detect and handle attacks
+        benign_results = []
+        data_poisoning_results = []
+        model_poisoning_results = []
+        
+        for client, fit_res in results:
+            attack_type = fit_res.metrics.get("attack_type", "none")
+            
+            if attack_type == "model":
+                model_poisoning_results.append((client, fit_res))
+                print(f"⚠️ Detected model poisoning from client {client.cid}")
+            elif attack_type == "data":
+                data_poisoning_results.append((client, fit_res))
+                print(f"⚠️ Detected data poisoning from client {client.cid}")
+            else:
+                benign_results.append((client, fit_res))
+        
+        # Option 1: Include all clients in aggregation (no defense)
         weights_results = []
         
         for _, fit_res in results:
@@ -276,18 +303,36 @@ class FedAvgStrategy(Strategy):
             ndarrays = parameters_to_ndarrays(parameters)
             weights_results.append((ndarrays, num_examples))
         
+        # Option 2: Exclude attackers from aggregation (simple defense)
+        # Uncomment to enable defense mechanism
+        # weights_results = []
+        # for _, fit_res in benign_results:
+        #     parameters = fit_res.parameters
+        #     num_examples = fit_res.num_examples
+        #     ndarrays = parameters_to_ndarrays(parameters)
+        #     weights_results.append((ndarrays, num_examples))
+        
         # Aggregate parameters using weighted average
         aggregated_ndarrays = self.aggregate_parameters(weights_results)
         
         # Aggregate metrics
         metrics_aggregated = {}
         if len(results) > 0:
-            metrics_aggregated["train_loss"] = np.mean([
-                res.metrics["train_loss"] for _, res in results
-            ])
-            metrics_aggregated["train_accuracy"] = np.mean([
-                res.metrics["train_accuracy"] for _, res in results
-            ])
+            # Track numeric metrics
+            numeric_metrics = ["train_loss", "train_accuracy"]
+            for metric in numeric_metrics:
+                metrics_aggregated[metric] = np.mean([
+                    res.metrics[metric] for _, res in results if metric in res.metrics
+                ])
+            
+            # Count attack types
+            attack_counts = {"none": 0, "data": 0, "model": 0}
+            for _, fit_res in results:
+                attack_type = fit_res.metrics.get("attack_type", "none")
+                attack_counts[attack_type] += 1
+            
+            # Add attack summary to metrics
+            metrics_aggregated["attack_summary"] = f"benign: {attack_counts['none']}, data: {attack_counts['data']}, model: {attack_counts['model']}"
         
         return ndarrays_to_parameters(aggregated_ndarrays), metrics_aggregated
     
@@ -379,6 +424,7 @@ class FedAvgStrategy(Strategy):
         
         # Aggregate metrics dictionary
         metrics_aggregated = {}
+        attack_types_count = {}
         
         for _, evaluate_res in results:
             loss = evaluate_res.loss
@@ -391,15 +437,29 @@ class FedAvgStrategy(Strategy):
             # Aggregate metrics from each client
             if evaluate_res.metrics:
                 for key, value in evaluate_res.metrics.items():
-                    if key not in metrics_aggregated:
-                        metrics_aggregated[key] = 0.0
-                    metrics_aggregated[key] += value * num_examples
+                    # Handle numeric metrics
+                    if isinstance(value, (int, float)) and key not in ["client_id"]:
+                        if key not in metrics_aggregated:
+                            metrics_aggregated[key] = 0.0
+                        metrics_aggregated[key] += value * num_examples
+                    # Count attack types
+                    elif key == "attack_type":
+                        attack_type = str(value)
+                        if attack_type not in attack_types_count:
+                            attack_types_count[attack_type] = 0
+                        attack_types_count[attack_type] += 1
         
         # Calculate average loss
         average_loss = total_loss / total_examples if total_examples > 0 else None
         
         # Calculate average metrics
-        for key in metrics_aggregated:
-            metrics_aggregated[key] /= total_examples
+        for key in list(metrics_aggregated.keys()):
+            if isinstance(metrics_aggregated[key], (int, float)):
+                metrics_aggregated[key] /= total_examples
+        
+        # Add attack type summary
+        if attack_types_count:
+            attacks_str = ", ".join(f"{type}: {count}" for type, count in attack_types_count.items())
+            metrics_aggregated["attack_types"] = attacks_str
         
         return average_loss, metrics_aggregated
